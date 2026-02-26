@@ -3,4 +3,3 @@ dist
 *.db
 .env
 .env.local
-.DS_Store

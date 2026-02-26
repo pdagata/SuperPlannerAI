@@ -1,5 +1,6 @@
 {
   "name": "AgileFlow AI",
-  "description": "SaaS project management with Kanban, Agile workflows, and AI-powered task automation.",
-  "requestFramePermissions": []
+  "version": "1.0.0",
+  "description": "AI-powered Agile project management SaaS platform",
+  "stack": ["React 19", "TypeScript", "Express", "SQLite/PostgreSQL", "Stripe", "Docker"]
 }
