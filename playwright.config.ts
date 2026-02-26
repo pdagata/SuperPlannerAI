@@ -8,19 +8,26 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: 'html',
   use: {
-    baseURL: 'http://localhost:5000',
+    baseURL: 'http://localhost:3000',
     trace: 'on-first-retry',
   },
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: {
+          executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ||
+            '/root/.cache/ms-playwright/chromium-1194/chrome-linux/chrome',
+          args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        },
+      },
     },
   ],
   webServer: {
     command: 'npm run dev',
-    url: 'http://localhost:5000',
-    reuseExistingServer: !process.env.CI,
+    url: 'http://localhost:3000',
+    reuseExistingServer: true,
     timeout: 120 * 1000,
   },
 });

@@ -12,8 +12,8 @@ test.describe('Authentication', () => {
   });
 
   test('shows error on wrong credentials', async ({ page }) => {
-    await page.getByLabel(/username or email/i).fill('wronguser');
-    await page.getByLabel(/password/i).fill('wrongpass');
+    await page.locator('input[type="text"]').fill('wronguser');
+    await page.locator('input[type="password"]').fill('wrongpass');
     await page.getByRole('button', { name: /sign in/i }).click();
     await expect(page.getByText(/invalid credentials|connection error/i)).toBeVisible({ timeout: 5000 });
   });
