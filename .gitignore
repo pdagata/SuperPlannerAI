@@ -4,3 +4,7 @@ dist
 .env
 .env.local
 .DS_Store
+playwright-report/
+test-results/
+*.db-shm
+*.db-wal
