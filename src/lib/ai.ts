@@ -36,7 +36,8 @@ export interface AIMessage {
 export async function callAI(
   config: AIConfig,
   messages: AIMessage[],
-  taskContext?: string
+  taskContext?: string,
+  signal?: AbortSignal
 ): Promise<string> {
   const provider  = config.provider || 'gemini';
   const model     = config.model || DEFAULT_MODELS[provider];
@@ -47,18 +48,21 @@ export async function callAI(
 
   try {
     switch (provider) {
-      case 'gemini': return await callGemini(config.apiKey || process.env.GEMINI_API_KEY || '', model, fullSystem, messages);
-      case 'openai': return await callOpenAI(config.apiKey || process.env.OPENAI_API_KEY || '', model, fullSystem, messages);
-      case 'claude': return await callClaude(config.apiKey || process.env.ANTHROPIC_API_KEY || '', model, fullSystem, messages);
+      case 'gemini': return await callGemini(config.apiKey || process.env.GEMINI_API_KEY || '', model, fullSystem, messages, signal);
+      case 'openai': return await callOpenAI(config.apiKey || process.env.OPENAI_API_KEY || '', model, fullSystem, messages, signal);
+      case 'claude': return await callClaude(config.apiKey || process.env.ANTHROPIC_API_KEY || '', model, fullSystem, messages, signal);
       default: throw new Error(`Unknown provider: ${provider}`);
     }
   } catch (err: any) {
+    if (err.name === 'AbortError' || err.message?.includes('aborted')) {
+      throw new Error('AI request was cancelled (timeout)');
+    }
     console.error(`AI error (${provider}):`, err.message);
     throw new Error(`AI provider error: ${err.message}`);
   }
 }
 
-async function callGemini(apiKey: string, model: string, system: string, messages: AIMessage[]): Promise<string> {
+async function callGemini(apiKey: string, model: string, system: string, messages: AIMessage[], signal?: AbortSignal): Promise<string> {
   const ai = new GoogleGenAI({ apiKey });
   const contents = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
@@ -67,12 +71,12 @@ async function callGemini(apiKey: string, model: string, system: string, message
   const response = await ai.models.generateContent({
     model,
     contents,
-    config: { systemInstruction: system, temperature: 0.7 }
+    config: { systemInstruction: system, temperature: 0.7, abortSignal: signal }
   });
   return response.text || '';
 }
 
-async function callOpenAI(apiKey: string, model: string, system: string, messages: AIMessage[]): Promise<string> {
+async function callOpenAI(apiKey: string, model: string, system: string, messages: AIMessage[], signal?: AbortSignal): Promise<string> {
   const client = new OpenAI({ apiKey });
   const response = await client.chat.completions.create({
     model,
@@ -81,18 +85,18 @@ async function callOpenAI(apiKey: string, model: string, system: string, message
       ...messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
     ],
     temperature: 0.7,
-  });
+  }, { signal });
   return response.choices[0]?.message?.content || '';
 }
 
-async function callClaude(apiKey: string, model: string, system: string, messages: AIMessage[]): Promise<string> {
+async function callClaude(apiKey: string, model: string, system: string, messages: AIMessage[], signal?: AbortSignal): Promise<string> {
   const client = new Anthropic({ apiKey });
   const response = await client.messages.create({
     model,
     max_tokens: 2048,
     system,
     messages: messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })),
-  });
+  }, { signal });
   const block = response.content[0];
   return block.type === 'text' ? block.text : '';
 }
@@ -102,7 +106,7 @@ export const AVAILABLE_MODELS: Record<AIProvider, { id: string; label: string }[
   gemini: [
     { id: 'gemini-2.0-flash',       label: 'Gemini 2.0 Flash (fast)' },
     { id: 'gemini-2.0-pro',         label: 'Gemini 2.0 Pro' },
-    { id: 'gemini-1.5-flash',       label: 'Gemini 1.5 Flash' },
+    { id: 'gemini-3-flash-preview', label: 'gemini-3-flash-preview' },
   ],
   openai: [
     { id: 'gpt-4o-mini',            label: 'GPT-4o Mini (fast)' },
