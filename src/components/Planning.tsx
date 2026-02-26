@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Layers, Target, Calendar, Plus, ChevronRight, ChevronDown, Trash2, User as UserIcon, Clock, CheckCircle2, Database, History, TrendingUp, AlertCircle, Tag } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Epic, Feature, Sprint, User as UserType, CustomFieldDefinition, CustomFieldValue, Priority, RoughEstimate, AuditLog, Project } from '../types';
+import { apiFetch } from '../auth';
 
 interface PlanningProps {
   epics: Epic[];
@@ -74,7 +75,7 @@ export default function Planning({
 
   const fetchCustomFields = async () => {
     try {
-      const res = await fetch('/api/custom-fields/definitions');
+      const res = await apiFetch('/api/custom-fields/definitions');
       const data = await res.json();
       setCustomFields(data);
     } catch (err) {
@@ -96,9 +97,8 @@ export default function Planning({
 
   const handleUpdateCustomValue = async (entityId: string, fieldId: string, value: string) => {
     try {
-      await fetch('/api/custom-fields/values', {
+      await apiFetch('/api/custom-fields/values', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           entity_id: entityId,
           field_definition_id: fieldId,
@@ -157,9 +157,8 @@ export default function Planning({
       progress: 0
     };
     try {
-      const res = await fetch('/api/epics', {
+      const res = await apiFetch('/api/epics', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...newEpic, user_id: currentUser.id })
       });
       if (res.ok) {
@@ -191,9 +190,8 @@ export default function Planning({
       creator_id: currentUser.id
     };
     try {
-      const res = await fetch('/api/features', {
+      const res = await apiFetch('/api/features', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...newFeature, user_id: currentUser.id })
       });
       if (res.ok) {
@@ -227,9 +225,8 @@ export default function Planning({
       creator_id: currentUser.id
     };
     try {
-      const res = await fetch('/api/sprints', {
+      const res = await apiFetch('/api/sprints', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...newSprint, user_id: currentUser.id })
       });
       if (res.ok) {

@@ -160,8 +160,14 @@ export interface TestCase {
   id: string;
   suite_id: string;
   title: string;
+  preconditions?: string;
   steps: string;
   expected_result: string;
+  actual_result?: string;
+  test_data?: string;
+  severity?: 'blocking' | 'high' | 'medium' | 'low';
   status: 'pending' | 'passed' | 'failed';
   last_run?: string;
+  automation_script?: string;
+  linked_task_id?: string;
 }

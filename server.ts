@@ -720,14 +720,57 @@ async function startServer() {
     res.status(201).json({ success: true });
   });
   app.get("/api/test-cases/:suiteId", async (req, res) => res.json(await query('SELECT * FROM test_cases WHERE suite_id = ?', [req.params.suiteId])));
-  app.post("/api/test-cases", async (req, res) => {
-    const { id, suite_id, title, steps, expected_result } = req.body;
-    await execute('INSERT INTO test_cases (id, suite_id, title, steps, expected_result) VALUES (?,?,?,?,?)', [id||uid(), suite_id, title, steps, expected_result]);
+  app.post("/api/test-cases", async (req: AuthReq, res) => {
+    const { id, suite_id, title, preconditions, steps, expected_result, actual_result, test_data, severity, linked_task_id } = req.body;
+    await execute(
+      'INSERT INTO test_cases (id, suite_id, title, preconditions, steps, expected_result, actual_result, test_data, severity, linked_task_id) VALUES (?,?,?,?,?,?,?,?,?,?)',
+      [id||uid(), suite_id, title, preconditions||null, steps, expected_result, actual_result||null, test_data||null, severity||'medium', linked_task_id||null]
+    );
     res.status(201).json({ success: true });
   });
-  app.patch("/api/test-cases/:id", async (req, res) => {
-    await execute('UPDATE test_cases SET status = ?, last_run = ? WHERE id = ?', [req.body.status, now(), req.params.id]);
+  app.patch("/api/test-cases/:id", async (req: AuthReq, res) => {
+    const updates: Record<string, unknown> = { ...req.body };
+    if (updates.status) updates.last_run = now();
+    const keys = Object.keys(updates);
+    if (keys.length === 0) return res.json({ success: true });
+    const setClause = keys.map(k => `${k} = ?`).join(', ');
+    const values = [...keys.map(k => updates[k]), req.params.id];
+    await execute(`UPDATE test_cases SET ${setClause} WHERE id = ?`, values);
     res.json({ success: true });
+  });
+  app.post("/api/test-cases/:id/generate-script", async (req: AuthReq, res) => {
+    try {
+      const testCase = await queryOne('SELECT * FROM test_cases WHERE id = ?', [req.params.id]);
+      if (!testCase) return res.status(404).json({ error: 'Test case not found' });
+      const configRow = await queryOne('SELECT * FROM ai_configurations WHERE tenant_id = ?', [req.authUser.tenant_id]);
+      const resolvedKey = configRow?.api_key_encrypted
+        || (configRow?.provider === 'openai' ? process.env.OPENAI_API_KEY : undefined)
+        || (configRow?.provider === 'claude'  ? process.env.ANTHROPIC_API_KEY : undefined)
+        || process.env.GEMINI_API_KEY;
+      if (!resolvedKey) return res.status(400).json({ error: 'AI not configured. Add an API key in Settings → AI.' });
+      const config = {
+        provider: configRow?.provider || 'gemini',
+        model: configRow?.model,
+        apiKey: resolvedKey,
+        systemPrompt: configRow?.system_prompt,
+        temperature: configRow?.temperature ?? 0.7,
+        tone: configRow?.tone,
+      };
+      const prompt = `Generate a Playwright TypeScript test for:
+Title: ${testCase.title}
+Preconditions: ${testCase.preconditions || 'None'}
+Steps: ${testCase.steps}
+Expected Result: ${testCase.expected_result}
+Test Data: ${testCase.test_data || 'None'}
+Return ONLY the TypeScript code, no explanation.`;
+      const timeoutMs = 30_000;
+      const script = await Promise.race([
+        callAI(config, [{ role: 'user', content: prompt }]),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('AI request timed out after 30 s')), timeoutMs)),
+      ]);
+      await execute('UPDATE test_cases SET automation_script = ? WHERE id = ?', [script, req.params.id]);
+      res.json({ script });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
   // ── VITE / STATIC ──────────────────────────────────────────────────────────

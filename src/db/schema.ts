@@ -233,14 +233,20 @@ const POSTGRES_SCHEMA = `
   );
 
   CREATE TABLE IF NOT EXISTS test_cases (
-    id              TEXT PRIMARY KEY,
-    suite_id        TEXT,
-    title           TEXT NOT NULL,
-    steps           TEXT,
-    expected_result TEXT,
-    status          TEXT DEFAULT 'pending',
-    last_run        TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ DEFAULT NOW()
+    id                TEXT PRIMARY KEY,
+    suite_id          TEXT,
+    title             TEXT NOT NULL,
+    preconditions     TEXT,
+    steps             TEXT,
+    expected_result   TEXT,
+    actual_result     TEXT,
+    severity          TEXT DEFAULT 'medium',
+    test_data         TEXT,
+    automation_script TEXT,
+    linked_task_id    TEXT,
+    status            TEXT DEFAULT 'pending',
+    last_run          TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ DEFAULT NOW()
   );
 
   INSERT INTO roles (id, name) VALUES
@@ -480,14 +486,20 @@ const SQLITE_SCHEMA = `
   );
 
   CREATE TABLE IF NOT EXISTS test_cases (
-    id              TEXT PRIMARY KEY,
-    suite_id        TEXT,
-    title           TEXT NOT NULL,
-    steps           TEXT,
-    expected_result TEXT,
-    status          TEXT DEFAULT 'pending',
-    last_run        TEXT,
-    created_at      TEXT DEFAULT (datetime('now'))
+    id                TEXT PRIMARY KEY,
+    suite_id          TEXT,
+    title             TEXT NOT NULL,
+    preconditions     TEXT,
+    steps             TEXT,
+    expected_result   TEXT,
+    actual_result     TEXT,
+    severity          TEXT DEFAULT 'medium',
+    test_data         TEXT,
+    automation_script TEXT,
+    linked_task_id    TEXT,
+    status            TEXT DEFAULT 'pending',
+    last_run          TEXT,
+    created_at        TEXT DEFAULT (datetime('now'))
   );
 
   INSERT OR IGNORE INTO roles (id, name) VALUES
@@ -500,5 +512,29 @@ const SQLITE_SCHEMA = `
 export async function createSchema(): Promise<void> {
   console.log(`📋 Running schema migrations (${isPostgres ? 'PostgreSQL/Supabase' : 'SQLite'})…`);
   await execRaw(isPostgres ? POSTGRES_SCHEMA : SQLITE_SCHEMA);
+  await migrateTestCases();
   console.log('✅ Schema ready.');
+}
+
+const TEST_CASE_NEW_COLS: { col: string; def: string }[] = [
+  { col: 'preconditions',     def: 'TEXT' },
+  { col: 'actual_result',     def: 'TEXT' },
+  { col: 'severity',          def: "TEXT DEFAULT 'medium'" },
+  { col: 'test_data',         def: 'TEXT' },
+  { col: 'automation_script', def: 'TEXT' },
+  { col: 'linked_task_id',    def: 'TEXT' },
+];
+
+async function migrateTestCases(): Promise<void> {
+  for (const { col, def } of TEST_CASE_NEW_COLS) {
+    try {
+      if (isPostgres) {
+        await execRaw(`ALTER TABLE test_cases ADD COLUMN IF NOT EXISTS ${col} ${def}`);
+      } else {
+        await execRaw(`ALTER TABLE test_cases ADD COLUMN ${col} ${def}`);
+      }
+    } catch {
+      // Column already exists (SQLite doesn't support IF NOT EXISTS for ADD COLUMN)
+    }
+  }
 }
