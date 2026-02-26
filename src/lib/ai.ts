@@ -1,6 +1,7 @@
 /**
  * Universal AI provider abstraction.
  * Supports Gemini, OpenAI, and Anthropic Claude.
+ * Config is per-tenant and stored in ai_configurations table.
  */
 import { GoogleGenAI } from '@google/genai';
 import OpenAI from 'openai';
@@ -11,7 +12,7 @@ export type AIProvider = 'gemini' | 'openai' | 'claude';
 export interface AIConfig {
   provider: AIProvider;
   model?: string;
-  apiKey?: string;
+  apiKey?: string;          // per-tenant key (overrides env)
   systemPrompt?: string;
   temperature?: number;
   tone?: 'professional' | 'casual' | 'technical' | 'friendly';
@@ -96,6 +97,7 @@ async function callClaude(apiKey: string, model: string, system: string, message
   return block.type === 'text' ? block.text : '';
 }
 
+// ── Available models per provider ─────────────────────────────────────────────
 export const AVAILABLE_MODELS: Record<AIProvider, { id: string; label: string }[]> = {
   gemini: [
     { id: 'gemini-2.0-flash',       label: 'Gemini 2.0 Flash (fast)' },
