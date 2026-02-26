@@ -16,7 +16,7 @@ export default defineConfig(({mode}) => {
       },
     },
     server: {
-      hmr: process.env.DISABLE_HMR !== 'true',
-    },
+  allowedHosts: true // Oppure 'all' nelle versioni più recenti di Vite
+},
   };
 });
