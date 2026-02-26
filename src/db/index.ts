@@ -14,13 +14,30 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Auto-construct DATABASE_URL from Supabase env vars ────────────────────────
-if (!process.env.DATABASE_URL && process.env.SUPABASE_URL && process.env.SUPABASE_DB_PASSWORD) {
+/*if (!process.env.DATABASE_URL && process.env.SUPABASE_URL && process.env.SUPABASE_DB_PASSWORD) {
   const projectRef = process.env.SUPABASE_URL
     .replace(/^https?:\/\//, '')
     .split('.')[0];
   process.env.DATABASE_URL =
     `postgresql://postgres:${process.env.SUPABASE_DB_PASSWORD}` +
     `@db.${projectRef}.supabase.co:5432/postgres`;
+  console.log(`🔗 Supabase: using project "${projectRef}"`);
+}*/
+
+// ── Auto-construct DATABASE_URL from Supabase env vars ────────────────────────
+// ── Auto-construct DATABASE_URL from Supabase env vars ────────────────────────
+if (!process.env.DATABASE_URL && process.env.SUPABASE_URL && process.env.SUPABASE_DB_PASSWORD) {
+  const projectRef = process.env.SUPABASE_URL
+    .replace(/^https?:\/\//, '')
+    .split('.')[0];
+    
+  // Encode the password so characters like @, #, ? don't break the URL
+  const encodedPassword = encodeURIComponent(process.env.SUPABASE_DB_PASSWORD);
+
+  process.env.DATABASE_URL =
+    `postgresql://postgres:${encodedPassword}` +
+    `@db.${projectRef}.supabase.co:5432/postgres`;
+    
   console.log(`🔗 Supabase: using project "${projectRef}"`);
 }
 

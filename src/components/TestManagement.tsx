@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import {
   Beaker, Plus, Play, CheckCircle2, XCircle, Clock, ChevronRight,
-  FileCode, TestTube, X, Wand2, Link, AlertTriangle, ChevronDown
+  FileCode, TestTube, X, Wand2, Link, AlertTriangle, ChevronDown, Terminal
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { TestSuite, TestCase, Task } from '../types';
@@ -51,6 +51,8 @@ export default function TestManagement() {
   const [activeTab, setActiveTab]         = useState<'details' | 'automation' | 'traceability'>('details');
   const [generatingScript, setGeneratingScript] = useState(false);
   const [scriptError, setScriptError]     = useState<string | null>(null);
+  const [runningScript, setRunningScript] = useState(false);
+  const [runOutput, setRunOutput]         = useState<{ status: 'passed' | 'failed'; output: string } | null>(null);
 
   // Create / edit modal
   const [showForm, setShowForm]   = useState(false);
@@ -211,6 +213,32 @@ export default function TestManagement() {
     }
   };
 
+  // ── Run automation script ───────────────────────────────────────────────────
+
+  const runScript = async () => {
+    if (!selectedTest) return;
+    setRunningScript(true);
+    setRunOutput(null);
+    try {
+      const res  = await apiFetch(`/api/test-cases/${selectedTest.id}/run-script`, { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok) {
+        setRunOutput({ status: 'failed', output: data.error || 'Errore durante l\'esecuzione.' });
+        return;
+      }
+      setRunOutput(data);
+      setTestCases(prev =>
+        prev.map(t => t.id === selectedTest.id
+          ? { ...t, status: data.status, last_run: new Date().toISOString() }
+          : t)
+      );
+    } catch (err: any) {
+      setRunOutput({ status: 'failed', output: err.message || 'Errore di rete.' });
+    } finally {
+      setRunningScript(false);
+    }
+  };
+
   // ── Inline actual_result save ───────────────────────────────────────────────
 
   const saveActualResult = async (value: string) => {
@@ -322,7 +350,7 @@ export default function TestManagement() {
                   initial={{ opacity: 0, x: -10 }}
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ delay: i * 0.04 }}
-                  onClick={() => { setSelectedTest(test); setActiveTab('details'); setScriptError(null); }}
+                  onClick={() => { setSelectedTest(test); setActiveTab('details'); setScriptError(null); setRunOutput(null); }}
                   className={`grid grid-cols-12 gap-4 p-4 border-b border-gray-50 hover:bg-gray-50/50 transition-all items-center cursor-pointer ${selectedTest?.id === test.id ? 'bg-indigo-50/40' : ''}`}
                 >
                   <div className="col-span-5 flex items-center gap-4 pl-4">
@@ -471,24 +499,52 @@ export default function TestManagement() {
               {/* ── Automation tab ── */}
               {activeTab === 'automation' && (
                 <>
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
                     <p className="text-sm text-gray-500">Script Playwright TypeScript generato via AI.</p>
-                    <button
-                      onClick={generateScript}
-                      disabled={generatingScript}
-                      className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 transition-all disabled:opacity-60 shadow-lg shadow-indigo-100 flex-shrink-0"
-                    >
-                      {generatingScript
-                        ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                        : <Wand2 size={16} />}
-                      {generatingScript ? 'Generazione…' : 'Genera con AI'}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      {selectedTest.automation_script && (
+                        <button
+                          onClick={runScript}
+                          disabled={runningScript || generatingScript}
+                          className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white text-sm font-bold rounded-xl hover:bg-emerald-700 transition-all disabled:opacity-60 shadow-lg shadow-emerald-100 flex-shrink-0"
+                        >
+                          {runningScript
+                            ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                            : <Terminal size={16} />}
+                          {runningScript ? 'Esecuzione…' : 'Esegui script'}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => { setRunOutput(null); generateScript(); }}
+                        disabled={generatingScript || runningScript}
+                        className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 transition-all disabled:opacity-60 shadow-lg shadow-indigo-100 flex-shrink-0"
+                      >
+                        {generatingScript
+                          ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                          : <Wand2 size={16} />}
+                        {generatingScript ? 'Generazione…' : 'Genera con AI'}
+                      </button>
+                    </div>
                   </div>
 
                   {scriptError && (
                     <div className="flex items-start gap-2 p-3 bg-rose-50 border border-rose-200 rounded-xl text-sm text-rose-700">
                       <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
                       <span>{scriptError}</span>
+                    </div>
+                  )}
+
+                  {runOutput && (
+                    <div className={`rounded-xl border p-3 text-sm ${runOutput.status === 'passed' ? 'bg-emerald-50 border-emerald-200' : 'bg-rose-50 border-rose-200'}`}>
+                      <div className={`flex items-center gap-2 font-bold mb-2 ${runOutput.status === 'passed' ? 'text-emerald-700' : 'text-rose-700'}`}>
+                        {runOutput.status === 'passed' ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
+                        {runOutput.status === 'passed' ? 'Test PASSATO' : 'Test FALLITO'}
+                      </div>
+                      {runOutput.output && (
+                        <pre className="text-xs font-mono text-gray-700 bg-white/70 rounded-lg p-2 overflow-x-auto whitespace-pre-wrap max-h-48">
+                          {runOutput.output}
+                        </pre>
+                      )}
                     </div>
                   )}
 

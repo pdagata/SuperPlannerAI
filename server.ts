@@ -3,6 +3,9 @@ import express, { Request, Response, NextFunction } from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
+import { exec } from "child_process";
+import { writeFile, unlink } from "fs/promises";
+import os from "os";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
@@ -407,23 +410,38 @@ async function startServer() {
 
   // AI Chat endpoint
   app.post("/api/ai/chat", async (req: AuthReq, res) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25_000);
     try {
       const { messages, taskContext } = req.body;
       const tenantId = req.authUser.tenant_id;
       const configRow = await queryOne('SELECT * FROM ai_configurations WHERE tenant_id = ?', [tenantId]);
+      const provider = configRow?.provider || 'gemini';
+      const resolvedKey = configRow?.api_key_encrypted
+        || (provider === 'openai' ? process.env.OPENAI_API_KEY : undefined)
+        || (provider === 'claude'  ? process.env.ANTHROPIC_API_KEY : undefined)
+        || process.env.GEMINI_API_KEY;
+      if (!resolvedKey) return res.status(400).json({ error: 'AI non configurato. Aggiungi una API key in Impostazioni → AI.' });
 
       const config = {
-        provider: configRow?.provider || 'gemini',
+        provider,
         model: configRow?.model,
-        apiKey: configRow?.api_key_encrypted,
+        apiKey: resolvedKey,
         systemPrompt: configRow?.system_prompt,
         temperature: configRow?.temperature,
         tone: configRow?.tone,
       };
 
-      const reply = await callAI(config, messages, taskContext);
+      const reply = await callAI(config, messages, taskContext, controller.signal);
       res.json({ reply });
-    } catch (e: any) { res.status(500).json({ error: e.message }); }
+    } catch (e: any) {
+      const msg = e.name === 'AbortError' || e.message?.includes('cancelled')
+        ? 'Timeout: la richiesta AI ha impiegato troppo tempo.'
+        : (e.message || 'Errore AI');
+      res.status(500).json({ error: msg });
+    } finally {
+      clearTimeout(timer);
+    }
   });
 
   // ── PROJECTS ───────────────────────────────────────────────────────────────
@@ -739,17 +757,20 @@ async function startServer() {
     res.json({ success: true });
   });
   app.post("/api/test-cases/:id/generate-script", async (req: AuthReq, res) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25_000);
     try {
       const testCase = await queryOne('SELECT * FROM test_cases WHERE id = ?', [req.params.id]);
       if (!testCase) return res.status(404).json({ error: 'Test case not found' });
       const configRow = await queryOne('SELECT * FROM ai_configurations WHERE tenant_id = ?', [req.authUser.tenant_id]);
+      const provider = configRow?.provider || 'gemini';
       const resolvedKey = configRow?.api_key_encrypted
-        || (configRow?.provider === 'openai' ? process.env.OPENAI_API_KEY : undefined)
-        || (configRow?.provider === 'claude'  ? process.env.ANTHROPIC_API_KEY : undefined)
+        || (provider === 'openai' ? process.env.OPENAI_API_KEY : undefined)
+        || (provider === 'claude'  ? process.env.ANTHROPIC_API_KEY : undefined)
         || process.env.GEMINI_API_KEY;
-      if (!resolvedKey) return res.status(400).json({ error: 'AI not configured. Add an API key in Settings → AI.' });
+      if (!resolvedKey) return res.status(400).json({ error: 'AI non configurato. Aggiungi una API key in Impostazioni → AI.' });
       const config = {
-        provider: configRow?.provider || 'gemini',
+        provider,
         model: configRow?.model,
         apiKey: resolvedKey,
         systemPrompt: configRow?.system_prompt,
@@ -759,18 +780,55 @@ async function startServer() {
       const prompt = `Generate a Playwright TypeScript test for:
 Title: ${testCase.title}
 Preconditions: ${testCase.preconditions || 'None'}
-Steps: ${testCase.steps}
-Expected Result: ${testCase.expected_result}
+Steps: ${testCase.steps || 'No steps provided'}
+Expected Result: ${testCase.expected_result || 'No expected result'}
 Test Data: ${testCase.test_data || 'None'}
-Return ONLY the TypeScript code, no explanation.`;
-      const timeoutMs = 30_000;
-      const script = await Promise.race([
-        callAI(config, [{ role: 'user', content: prompt }]),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('AI request timed out after 30 s')), timeoutMs)),
-      ]);
+Return ONLY the TypeScript code block, no explanation.`;
+      const script = await callAI(config, [{ role: 'user', content: prompt }], undefined, controller.signal);
+      if (!script) return res.status(500).json({ error: "L'AI non ha restituito uno script. Riprova." });
       await execute('UPDATE test_cases SET automation_script = ? WHERE id = ?', [script, req.params.id]);
       res.json({ script });
-    } catch (e: any) { res.status(500).json({ error: e.message }); }
+    } catch (e: any) {
+      const msg = e.name === 'AbortError' || e.message?.includes('cancelled')
+        ? 'Timeout: la richiesta AI ha impiegato troppo tempo (>25s). Riprova.'
+        : (e.message || 'Errore AI sconosciuto');
+      res.status(500).json({ error: msg });
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  // ── EXECUTE TEST SCRIPT ────────────────────────────────────────────────────
+  app.post("/api/test-cases/:id/run-script", async (req: AuthReq, res) => {
+    const testCase = await queryOne('SELECT * FROM test_cases WHERE id = ?', [req.params.id]);
+    if (!testCase) return res.status(404).json({ error: 'Test case not found' });
+    if (!testCase.automation_script) return res.status(400).json({ error: 'Nessuno script disponibile. Genera prima lo script con AI.' });
+
+    const tmpFile = path.join(os.tmpdir(), `agileflow-test-${req.params.id}.spec.ts`);
+    try {
+      await writeFile(tmpFile, testCase.automation_script, 'utf8');
+
+      const result = await new Promise<{ status: 'passed' | 'failed'; output: string }>((resolve) => {
+        const cmd = `npx playwright test "${tmpFile}" --reporter line 2>&1`;
+        exec(cmd, { timeout: 60_000, cwd: process.cwd() }, (err, stdout, stderr) => {
+          const output = (stdout || '') + (stderr || '');
+          if (err && err.code !== 0) {
+            resolve({ status: 'failed', output: output || err.message });
+          } else {
+            resolve({ status: 'passed', output });
+          }
+        });
+      });
+
+      await execute('UPDATE test_cases SET status = ?, last_run = ? WHERE id = ?',
+        [result.status, new Date().toISOString(), req.params.id]);
+
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    } finally {
+      unlink(tmpFile).catch(() => {});
+    }
   });
 
   // ── VITE / STATIC ──────────────────────────────────────────────────────────
