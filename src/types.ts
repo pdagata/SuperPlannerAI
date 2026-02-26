@@ -16,7 +16,7 @@ export interface Project {
   name: string;
   description: string;
   creator_id: string;
-  admin_ids?: string[];
+  admin_ids?: string[]; // New field for assigned admin users
   created_at?: string;
 }
 
@@ -25,12 +25,12 @@ export interface Task {
   feature_id: string;
   sprint_id?: string;
   title: string;
-  statement?: string;
-  description: string;
-  acceptance_criteria?: string;
+  statement?: string; // "Come [ruolo], voglio [azione], affinché [valore]"
+  description: string; // Technical Description
+  acceptance_criteria?: string; // Micro
   status: string;
   priority: Priority;
-  story_points: number;
+  story_points: number; // Fibonacci
   assignee_id?: string;
   reporter_id?: string;
   column_id: string;
@@ -43,7 +43,7 @@ export interface Task {
   created_at?: string;
   updated_at?: string;
   closed_at?: string;
-  user_id?: string;
+  user_id?: string; // For audit logging in requests
 }
 
 export interface Epic {
@@ -51,7 +51,7 @@ export interface Epic {
   project_id?: string;
   title: string;
   business_value?: string;
-  description: string;
+  description: string; // Rich Text
   status: 'Backlog' | 'In Approvazione' | 'In Corso' | 'Completata' | 'Archiviata';
   priority: Priority;
   owner_id?: string;
@@ -69,7 +69,7 @@ export interface Feature {
   epic_id: string;
   title: string;
   benefit_hypothesis?: string;
-  acceptance_criteria?: string;
+  acceptance_criteria?: string; // Macro
   rough_estimate?: RoughEstimate;
   status: 'Draft' | 'Ready for Dev' | 'In Progress' | 'Verified';
   tags?: string;
@@ -104,7 +104,7 @@ export interface AuditLog {
   user_id: string;
   user_name?: string;
   action: string;
-  changes: string;
+  changes: string; // JSON string
   created_at: string;
 }
 
