@@ -1,694 +1,749 @@
-import express from "express";
+import 'dotenv/config';
+import express, { Request, Response, NextFunction } from "express";
 import { createServer as createViteServer } from "vite";
-import Database from "better-sqlite3";
 import path from "path";
 import { fileURLToPath } from "url";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import { v4 as uuidv4 } from "uuid";
+import { createSchema } from "./src/db/schema.js";
+import { query, queryOne, execute, isPostgres } from "./src/db/index.js";
+import { stripe, PLANS, PlanId } from "./src/lib/stripe.js";
+import { sendInviteEmail, sendVerifyEmail, sendPasswordResetEmail, sendWelcomeEmail } from "./src/lib/email.js";
+import { callAI, AVAILABLE_MODELS, DEFAULT_SYSTEM_PROMPT } from "./src/lib/ai.js";
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname  = path.dirname(__filename);
 
-const db = new Database("agileflow.db");
+const JWT_SECRET         = process.env.JWT_SECRET || "CHANGE_ME_IN_PROD_32chars_minimum!";
+const JWT_EXPIRES_IN     = "8h";
+const REFRESH_EXPIRES_IN = "7d";
+const BCRYPT_ROUNDS      = 10;
+const uid = () => uuidv4();
+const now = () => new Date().toISOString();
 
-// Initialize DB
-db.exec(`
-  CREATE TABLE IF NOT EXISTS roles (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL
-  );
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+const signAccess  = (p: object) => jwt.sign(p, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+const signRefresh = (p: object) => jwt.sign(p, JWT_SECRET, { expiresIn: REFRESH_EXPIRES_IN });
+const verifyTok   = (t: string)  => jwt.verify(t, JWT_SECRET) as any;
 
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    role_id TEXT,
-    full_name TEXT,
-    email TEXT,
-    FOREIGN KEY(role_id) REFERENCES roles(id)
-  );
+interface AuthReq extends Request { authUser?: any; }
 
-  CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    creator_id TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(creator_id) REFERENCES users(id)
-  );
+function requireAuth(req: AuthReq, res: Response, next: NextFunction) {
+  const h = req.headers['authorization'];
+  if (!h?.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing token' });
+  try { req.authUser = verifyTok(h.split(' ')[1]); next(); }
+  catch { res.status(401).json({ error: 'Token expired or invalid' }); }
+}
 
-  CREATE TABLE IF NOT EXISTS columns (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    "order" INTEGER NOT NULL
-  );
+function requireRole(...roles: string[]) {
+  return (req: AuthReq, res: Response, next: NextFunction) => {
+    if (!roles.includes(req.authUser?.role_id)) return res.status(403).json({ error: 'Insufficient permissions' });
+    next();
+  };
+}
 
-  CREATE TABLE IF NOT EXISTS epics (
-    id TEXT PRIMARY KEY,
-    project_id TEXT,
-    title TEXT NOT NULL,
-    business_value TEXT,
-    description TEXT,
-    status TEXT DEFAULT 'Backlog',
-    priority TEXT DEFAULT 'P3',
-    owner_id TEXT,
-    creator_id TEXT,
-    start_date DATETIME,
-    end_date DATETIME,
-    progress REAL DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    closed_at DATETIME,
-    FOREIGN KEY(project_id) REFERENCES projects(id),
-    FOREIGN KEY(owner_id) REFERENCES users(id),
-    FOREIGN KEY(creator_id) REFERENCES users(id)
-  );
+// ── Tenant helpers ────────────────────────────────────────────────────────────
+async function getTenant(tenantId: string) {
+  return queryOne('SELECT * FROM tenants WHERE id = ?', [tenantId]);
+}
 
-  CREATE TABLE IF NOT EXISTS features (
-    id TEXT PRIMARY KEY,
-    epic_id TEXT NOT NULL,
-    title TEXT NOT NULL,
-    benefit_hypothesis TEXT,
-    acceptance_criteria TEXT,
-    rough_estimate TEXT,
-    status TEXT DEFAULT 'Draft',
-    tags TEXT,
-    assignee_id TEXT,
-    creator_id TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    closed_at DATETIME,
-    FOREIGN KEY(epic_id) REFERENCES epics(id),
-    FOREIGN KEY(assignee_id) REFERENCES users(id),
-    FOREIGN KEY(creator_id) REFERENCES users(id)
-  );
+async function checkPlanLimit(tenantId: string, resource: 'projects' | 'members') {
+  const tenant = await getTenant(tenantId);
+  if (!tenant) return false;
+  const plan = PLANS[tenant.plan as PlanId];
+  if (!plan) return false;
+  if (resource === 'projects') {
+    if (plan.max_projects === -1) return true;
+    const count = await queryOne('SELECT COUNT(*) as c FROM projects WHERE tenant_id = ?', [tenantId]);
+    return (count?.c || 0) < plan.max_projects;
+  }
+  if (resource === 'members') {
+    if (plan.max_members === -1) return true;
+    const count = await queryOne('SELECT COUNT(*) as c FROM users WHERE tenant_id = ?', [tenantId]);
+    return (count?.c || 0) < plan.max_members;
+  }
+  return false;
+}
 
-  CREATE TABLE IF NOT EXISTS sprints (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    goal TEXT,
-    start_date DATETIME,
-    end_date DATETIME,
-    status TEXT DEFAULT 'Pianificato',
-    target_capacity INTEGER DEFAULT 0,
-    actual_velocity INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    closed_at DATETIME,
-    assignee_id TEXT,
-    creator_id TEXT,
-    FOREIGN KEY(assignee_id) REFERENCES users(id),
-    FOREIGN KEY(creator_id) REFERENCES users(id)
-  );
+async function getVisibleProjectIds(userId: string, roleId: string, tenantId: string): Promise<string[] | null> {
+  if (roleId === 'superadmin') return null;
+  const rows = await query('SELECT project_id FROM project_members WHERE user_id = ?', [userId]);
+  return rows.map(r => r.project_id);
+}
 
-  CREATE TABLE IF NOT EXISTS tasks (
-    id TEXT PRIMARY KEY,
-    feature_id TEXT,
-    sprint_id TEXT,
-    title TEXT NOT NULL,
-    statement TEXT,
-    description TEXT,
-    acceptance_criteria TEXT,
-    story_points INTEGER DEFAULT 0,
-    status TEXT NOT NULL,
-    priority TEXT DEFAULT 'P3',
-    assignee_id TEXT,
-    reporter_id TEXT,
-    creator_id TEXT,
-    column_id TEXT,
-    type TEXT DEFAULT 'story', -- 'story', 'bug', 'issue'
-    epic_id TEXT,
-    parent_id TEXT,
-    definition_of_done TEXT,
-    blocker TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    closed_at DATETIME,
-    FOREIGN KEY(column_id) REFERENCES columns(id),
-    FOREIGN KEY(assignee_id) REFERENCES users(id),
-    FOREIGN KEY(reporter_id) REFERENCES users(id),
-    FOREIGN KEY(creator_id) REFERENCES users(id),
-    FOREIGN KEY(epic_id) REFERENCES epics(id),
-    FOREIGN KEY(feature_id) REFERENCES features(id),
-    FOREIGN KEY(sprint_id) REFERENCES sprints(id),
-    FOREIGN KEY(parent_id) REFERENCES tasks(id)
-  );
+async function logAudit(tenantId: string, entityType: string, entityId: string, userId: string, action: string, changes: any) {
+  await execute('INSERT INTO audit_logs (id, tenant_id, entity_type, entity_id, user_id, action, changes) VALUES (?,?,?,?,?,?,?)',
+    [uid(), tenantId, entityType, entityId, userId, action, JSON.stringify(changes)]);
+}
 
-  CREATE TABLE IF NOT EXISTS audit_logs (
-    id TEXT PRIMARY KEY,
-    entity_type TEXT NOT NULL,
-    entity_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    changes TEXT, -- JSON string
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS comments (
-    id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(task_id) REFERENCES tasks(id),
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS attachments (
-    id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    url TEXT NOT NULL,
-    type TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(task_id) REFERENCES tasks(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS custom_field_definitions (
-    id TEXT PRIMARY KEY,
-    entity_type TEXT NOT NULL, -- 'epic', 'feature', 'sprint', 'task', 'bug', 'issue'
-    name TEXT NOT NULL,
-    type TEXT NOT NULL, -- 'string', 'number', 'date', 'boolean'
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS custom_field_values (
-    id TEXT PRIMARY KEY,
-    entity_id TEXT NOT NULL,
-    field_definition_id TEXT NOT NULL,
-    value TEXT,
-    FOREIGN KEY(field_definition_id) REFERENCES custom_field_definitions(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS test_suites (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    description TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS test_cases (
-    id TEXT PRIMARY KEY,
-    suite_id TEXT,
-    title TEXT NOT NULL,
-    steps TEXT,
-    expected_result TEXT,
-    status TEXT DEFAULT 'pending',
-    last_run DATETIME,
-    FOREIGN KEY(suite_id) REFERENCES test_suites(id)
-  );
-`);
-
-// Migration: Add missing columns to existing tables
-const tables = {
-  users: [
-    { name: 'email', type: 'TEXT' }
-  ],
-  epics: [
-    { name: 'project_id', type: 'TEXT' },
-    { name: 'business_value', type: 'TEXT' },
-    { name: 'priority', type: 'TEXT DEFAULT "P3"' },
-    { name: 'owner_id', type: 'TEXT' },
-    { name: 'creator_id', type: 'TEXT' },
-    { name: 'start_date', type: 'DATETIME' },
-    { name: 'end_date', type: 'DATETIME' },
-    { name: 'progress', type: 'REAL DEFAULT 0' },
-    { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'updated_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'closed_at', type: 'DATETIME' }
-  ],
-  features: [
-    { name: 'benefit_hypothesis', type: 'TEXT' },
-    { name: 'acceptance_criteria', type: 'TEXT' },
-    { name: 'rough_estimate', type: 'TEXT' },
-    { name: 'tags', type: 'TEXT' },
-    { name: 'assignee_id', type: 'TEXT' },
-    { name: 'creator_id', type: 'TEXT' },
-    { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'updated_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'closed_at', type: 'DATETIME' }
-  ],
-  sprints: [
-    { name: 'goal', type: 'TEXT' },
-    { name: 'start_date', type: 'DATETIME' },
-    { name: 'end_date', type: 'DATETIME' },
-    { name: 'target_capacity', type: 'INTEGER DEFAULT 0' },
-    { name: 'actual_velocity', type: 'INTEGER DEFAULT 0' },
-    { name: 'assignee_id', type: 'TEXT' },
-    { name: 'creator_id', type: 'TEXT' },
-    { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'updated_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'closed_at', type: 'DATETIME' }
-  ],
-  tasks: [
-    { name: 'statement', type: 'TEXT' },
-    { name: 'acceptance_criteria', type: 'TEXT' },
-    { name: 'story_points', type: 'INTEGER DEFAULT 0' },
-    { name: 'priority', type: 'TEXT DEFAULT "P3"' },
-    { name: 'assignee_id', type: 'TEXT' },
-    { name: 'reporter_id', type: 'TEXT' },
-    { name: 'creator_id', type: 'TEXT' },
-    { name: 'type', type: 'TEXT DEFAULT "story"' },
-    { name: 'epic_id', type: 'TEXT' },
-    { name: 'sprint_id', type: 'TEXT' },
-    { name: 'parent_id', type: 'TEXT' },
-    { name: 'definition_of_done', type: 'TEXT' },
-    { name: 'blocker', type: 'TEXT' },
-    { name: 'created_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'updated_at', type: 'DATETIME DEFAULT CURRENT_TIMESTAMP' },
-    { name: 'closed_at', type: 'DATETIME' }
-  ]
-};
-
-for (const [table, columns] of Object.entries(tables)) {
-  try {
-    const info = db.prepare(`PRAGMA table_info(${table})`).all() as any[];
-    const existingColumns = info.map(c => c.name);
-    
-    for (const col of columns) {
-      if (!existingColumns.includes(col.name)) {
-        console.log(`Migrating: Adding ${col.name} to ${table}`);
-        db.prepare(`ALTER TABLE ${table} ADD COLUMN ${col.name} ${col.type}`).run();
-      }
+// ── Seed default columns per tenant ───────────────────────────────────────────
+async function seedTenantColumns(tenantId: string) {
+  const existing = await query('SELECT id FROM columns WHERE tenant_id = ?', [tenantId]);
+  if (existing.length === 0) {
+    for (const [id, title, order] of [['todo','To Do',0],['in-progress','In Progress',1],['review','Review',2],['done','Done',3]]) {
+      await execute('INSERT INTO columns (id, tenant_id, title, "order") VALUES (?,?,?,?)', [`${tenantId}-${id}`, tenantId, title, order]);
     }
-  } catch (e) {
-    console.error(`Migration failed for table ${table}:`, e);
   }
 }
 
-// Seed initial roles and admin user
-const roleCount = db.prepare("SELECT COUNT(*) as count FROM roles").get() as { count: number };
-if (roleCount.count === 0) {
-  const insertRole = db.prepare("INSERT INTO roles (id, name) VALUES (?, ?)");
-  insertRole.run("superadmin", "Super Administrator");
-  insertRole.run("admin", "Administrator");
-  insertRole.run("dev", "Developer");
-  insertRole.run("qa", "QA Engineer");
-
-  const insertUser = db.prepare("INSERT INTO users (id, username, password, role_id, full_name, email) VALUES (?, ?, ?, ?, ?, ?)");
-  insertUser.run("u1", "admin", "admin123", "superadmin", "System Admin", "admin@agileflow.ai");
-  insertUser.run("u2", "dev1", "dev123", "dev", "John Developer", "john@agileflow.ai");
-  insertUser.run("u3", "qa1", "qa123", "qa", "Sarah Tester", "sarah@agileflow.ai");
-}
-
-// Seed initial columns if empty
-const columnCount = db.prepare("SELECT COUNT(*) as count FROM columns").get() as { count: number };
-if (columnCount.count === 0) {
-  const insert = db.prepare("INSERT INTO columns (id, title, \"order\") VALUES (?, ?, ?)");
-  insert.run("todo", "To Do", 0);
-  insert.run("in-progress", "In Progress", 1);
-  insert.run("review", "Review", 2);
-  insert.run("done", "Done", 3);
-}
-
+// ─────────────────────────────────────────────────────────────────────────────
 async function startServer() {
+  await createSchema();
+
   const app = express();
-  const PORT = 3000;
+  const PORT = parseInt(process.env.PORT || '3000');
 
   app.use(express.json());
+  // Raw body for Stripe webhooks
+  app.use('/api/stripe/webhook', express.raw({ type: 'application/json' }));
 
-  // Auth Routes
-  app.post("/api/login", (req, res) => {
-    const { username, password } = req.body;
-    const user = db.prepare("SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE username = ?").get(username) as any;
-    
-    if (user && user.password === password) {
-      const { password: _, ...userWithoutPassword } = user;
-      res.json({ user: userWithoutPassword, token: "mock-jwt-token" });
-    } else {
-      res.status(401).json({ error: "Invalid credentials" });
+  // ── PUBLIC ROUTES ───────────────────────────────────────────────────────────
+
+  // Self-service registration
+  app.post("/api/register", async (req, res) => {
+    try {
+      const { workspaceName, workspaceSlug, fullName, email, password } = req.body;
+      if (!workspaceName || !email || !password || !fullName) return res.status(400).json({ error: 'All fields required' });
+      if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+
+      // Check slug uniqueness
+      const slug = (workspaceSlug || workspaceName).toLowerCase().replace(/[^a-z0-9]/g, '-');
+      const existing = await queryOne('SELECT id FROM tenants WHERE slug = ?', [slug]);
+      if (existing) return res.status(400).json({ error: 'Workspace slug already taken' });
+
+      const tenantId = uid();
+      const userId   = uid();
+      const trialEnd = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString();
+
+      await execute('INSERT INTO tenants (id, name, slug, plan, max_projects, max_members, trial_ends_at) VALUES (?,?,?,?,?,?,?)',
+        [tenantId, workspaceName, slug, 'free', 1, 5, trialEnd]);
+
+      const hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
+      const verifyToken = uid();
+      await execute('INSERT INTO users (id, tenant_id, username, password_hash, role_id, full_name, email, email_verify_token) VALUES (?,?,?,?,?,?,?,?)',
+        [userId, tenantId, email.split('@')[0], hash, 'superadmin', fullName, email, verifyToken]);
+
+      await seedTenantColumns(tenantId);
+
+      // Send welcome + verify email (non-blocking)
+      sendVerifyEmail(email, verifyToken).catch(console.error);
+      sendWelcomeEmail(email, fullName, workspaceName).catch(console.error);
+
+      const payload = { id: userId, tenant_id: tenantId, role_id: 'superadmin', role_name: 'Super Administrator' };
+      res.status(201).json({ accessToken: signAccess(payload), refreshToken: signRefresh({ id: userId }), tenantSlug: slug });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Login
+  app.post("/api/login", async (req, res) => {
+    try {
+      const { username, password, tenantSlug } = req.body;
+      let user: any;
+
+      if (tenantSlug) {
+        const tenant = await queryOne('SELECT id FROM tenants WHERE slug = ?', [tenantSlug]);
+        if (!tenant) return res.status(401).json({ error: 'Workspace not found' });
+        user = await queryOne(
+          'SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE (u.username = ? OR u.email = ?) AND u.tenant_id = ?',
+          [username, username, tenant.id]
+        );
+      } else {
+        user = await queryOne(
+          'SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE (u.username = ? OR u.email = ?) LIMIT 1',
+          [username, username]
+        );
+      }
+
+      if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      const payload = { id: user.id, tenant_id: user.tenant_id, role_id: user.role_id, role_name: user.role_name, username: user.username };
+      const accessToken  = signAccess(payload);
+      const refreshToken = signRefresh({ id: user.id });
+
+      const tokenHash = bcrypt.hashSync(refreshToken, 5);
+      const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      await execute('INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at) VALUES (?,?,?,?)', [uid(), user.id, tokenHash, expiresAt]);
+
+      const { password_hash: _, email_verify_token: __, reset_token: ___, ...safeUser } = user;
+      res.json({ user: safeUser, accessToken, refreshToken });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Refresh token
+  app.post("/api/refresh", async (req, res) => {
+    try {
+      const { refreshToken } = req.body;
+      if (!refreshToken) return res.status(401).json({ error: 'No refresh token' });
+      const decoded = verifyTok(refreshToken);
+      const stored = await query("SELECT * FROM refresh_tokens WHERE user_id = ? AND expires_at > ?", [decoded.id, now()]);
+      const valid = stored.find(t => bcrypt.compareSync(refreshToken, t.token_hash));
+      if (!valid) return res.status(401).json({ error: 'Invalid refresh token' });
+      const user = await queryOne('SELECT u.*, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.id = ?', [decoded.id]);
+      if (!user) return res.status(401).json({ error: 'User not found' });
+      const payload = { id: user.id, tenant_id: user.tenant_id, role_id: user.role_id, role_name: user.role_name, username: user.username };
+      res.json({ accessToken: signAccess(payload) });
+    } catch { res.status(401).json({ error: 'Refresh token expired' }); }
+  });
+
+  // Verify email
+  app.get("/api/verify-email", async (req, res) => {
+    const { token } = req.query as any;
+    await execute('UPDATE users SET email_verified = TRUE, email_verify_token = NULL WHERE email_verify_token = ?', [token]);
+    res.redirect('/?verified=1');
+  });
+
+  // Password reset request
+  app.post("/api/forgot-password", async (req, res) => {
+    try {
+      const { email } = req.body;
+      const user = await queryOne('SELECT * FROM users WHERE email = ?', [email]);
+      if (user) {
+        const token   = uid();
+        const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+        await execute('UPDATE users SET reset_token = ?, reset_token_expires = ? WHERE id = ?', [token, expires, user.id]);
+        await sendPasswordResetEmail(email, token);
+      }
+      res.json({ success: true }); // always 200 to prevent email enumeration
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Password reset
+  app.post("/api/reset-password", async (req, res) => {
+    try {
+      const { token, newPassword } = req.body;
+      if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'Password too short' });
+      const user = await queryOne('SELECT * FROM users WHERE reset_token = ? AND reset_token_expires > ?', [token, now()]);
+      if (!user) return res.status(400).json({ error: 'Invalid or expired token' });
+      const hash = bcrypt.hashSync(newPassword, BCRYPT_ROUNDS);
+      await execute('UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expires = NULL WHERE id = ?', [hash, user.id]);
+      res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Accept invitation
+  app.post("/api/accept-invite", async (req, res) => {
+    try {
+      const { token, fullName, password } = req.body;
+      const invite = await queryOne('SELECT * FROM invitations WHERE token = ? AND accepted_at IS NULL AND expires_at > ?', [token, now()]);
+      if (!invite) return res.status(400).json({ error: 'Invalid or expired invitation' });
+
+      const userId = uid();
+      const hash   = bcrypt.hashSync(password, BCRYPT_ROUNDS);
+      const username = invite.email.split('@')[0] + '_' + Math.random().toString(36).substr(2, 4);
+
+      await execute('INSERT INTO users (id, tenant_id, username, password_hash, role_id, full_name, email, email_verified, invited_by) VALUES (?,?,?,?,?,?,?,TRUE,?)',
+        [userId, invite.tenant_id, username, hash, invite.role_id, fullName, invite.email, invite.invited_by]);
+
+      if (invite.project_id) {
+        await execute('INSERT OR IGNORE INTO project_members (id, project_id, user_id, role) VALUES (?,?,?,?)', [uid(), invite.project_id, userId, 'member']);
+      }
+      await execute('UPDATE invitations SET accepted_at = ? WHERE id = ?', [now(), invite.id]);
+
+      const tenant = await getTenant(invite.tenant_id);
+      const payload = { id: userId, tenant_id: invite.tenant_id, role_id: invite.role_id, role_name: invite.role_id, username };
+      res.json({ accessToken: signAccess(payload), refreshToken: signRefresh({ id: userId }), tenantSlug: tenant?.slug });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── STRIPE WEBHOOKS (before auth middleware) ───────────────────────────────
+
+  app.post("/api/stripe/webhook", async (req, res) => {
+    const sig = req.headers['stripe-signature'] as string;
+    let event: any;
+    try {
+      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET || '');
+    } catch { return res.status(400).json({ error: 'Webhook signature failed' }); }
+
+    if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.created') {
+      const sub = event.data.object;
+      const customerId = sub.customer;
+      const priceId    = sub.items.data[0]?.price?.id;
+      const plan = Object.values(PLANS).find(p => p.priceId === priceId);
+      if (plan) {
+        await execute('UPDATE tenants SET plan = ?, stripe_subscription_id = ?, max_projects = ?, max_members = ? WHERE stripe_customer_id = ?',
+          [plan.id, sub.id, plan.max_projects, plan.max_members, customerId]);
+      }
     }
+    if (event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      await execute("UPDATE tenants SET plan = 'free', stripe_subscription_id = NULL, max_projects = 1, max_members = 5 WHERE stripe_customer_id = ?", [sub.customer]);
+    }
+    res.json({ received: true });
   });
 
-  // Projects API
-  app.get("/api/projects", (req, res) => {
-    res.json(db.prepare("SELECT * FROM projects").all());
-  });
+  // ── ALL ROUTES BELOW REQUIRE AUTH ──────────────────────────────────────────
+  app.use('/api', requireAuth);
 
-  app.post("/api/projects", (req, res) => {
-    const { id, name, description, creator_id } = req.body;
-    db.prepare("INSERT INTO projects (id, name, description, creator_id) VALUES (?, ?, ?, ?)")
-      .run(id, name, description, creator_id);
-    res.status(201).json({ success: true });
-  });
-
-  app.delete("/api/projects/:id", (req, res) => {
-    const { id } = req.params;
-    db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+  app.post("/api/logout", async (req: AuthReq, res) => {
+    await execute('DELETE FROM refresh_tokens WHERE user_id = ?', [req.authUser.id]);
     res.json({ success: true });
   });
 
-  // API Routes
-  app.get("/api/users", (req, res) => {
-    const users = db.prepare("SELECT id, username, full_name, role_id, email FROM users").all();
-    res.json(users);
+  // ── BILLING ────────────────────────────────────────────────────────────────
+
+  app.get("/api/billing/plans", (req, res) => res.json(PLANS));
+
+  app.get("/api/billing/current", async (req: AuthReq, res) => {
+    const tenant = await getTenant(req.authUser.tenant_id);
+    res.json(tenant);
   });
 
-  app.post("/api/users", (req, res) => {
-    const { id, username, password, role_id, full_name, email } = req.body;
-    db.prepare("INSERT INTO users (id, username, password, role_id, full_name, email) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(id, username, password, role_id, full_name, email);
-    res.status(201).json({ success: true });
+  app.post("/api/billing/checkout", async (req: AuthReq, res) => {
+    try {
+      const { planId } = req.body;
+      const plan = PLANS[planId as PlanId];
+      if (!plan || !plan.priceId) return res.status(400).json({ error: 'Invalid plan' });
+
+      const tenant = await getTenant(req.authUser.tenant_id);
+      if (!tenant) return res.status(404).json({ error: 'Tenant not found' });
+
+      let customerId = tenant.stripe_customer_id;
+      if (!customerId) {
+        const user = await queryOne('SELECT email, full_name FROM users WHERE id = ?', [req.authUser.id]);
+        const customer = await stripe.customers.create({ email: user?.email, name: user?.full_name, metadata: { tenant_id: tenant.id } });
+        customerId = customer.id;
+        await execute('UPDATE tenants SET stripe_customer_id = ? WHERE id = ?', [customerId, tenant.id]);
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        customer: customerId,
+        mode: 'subscription',
+        payment_method_types: ['card'],
+        line_items: [{ price: plan.priceId, quantity: 1 }],
+        success_url: `${process.env.APP_URL}/billing?success=1`,
+        cancel_url:  `${process.env.APP_URL}/billing?cancelled=1`,
+      });
+      res.json({ url: session.url });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
-  app.get("/api/columns", (req, res) => {
-    const columns = db.prepare("SELECT * FROM columns ORDER BY \"order\" ASC").all();
-    res.json(columns);
+  app.post("/api/billing/portal", async (req: AuthReq, res) => {
+    try {
+      const tenant = await getTenant(req.authUser.tenant_id);
+      if (!tenant?.stripe_customer_id) return res.status(400).json({ error: 'No Stripe customer' });
+      const session = await stripe.billingPortal.sessions.create({
+        customer: tenant.stripe_customer_id,
+        return_url: `${process.env.APP_URL}/billing`,
+      });
+      res.json({ url: session.url });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
   });
 
-  app.get("/api/tasks", (req, res) => {
-    const tasks = db.prepare("SELECT * FROM tasks").all();
-    res.json(tasks);
+  // ── TENANT INFO ────────────────────────────────────────────────────────────
+
+  app.get("/api/tenant", async (req: AuthReq, res) => {
+    const tenant = await getTenant(req.authUser.tenant_id);
+    res.json(tenant);
   });
 
-  const logAudit = (entity_type: string, entity_id: string, user_id: string, action: string, changes: any) => {
-    const id = Math.random().toString(36).substr(2, 9);
-    db.prepare("INSERT INTO audit_logs (id, entity_type, entity_id, user_id, action, changes) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(id, entity_type, entity_id, user_id, action, JSON.stringify(changes));
-  };
+  // ── INVITATIONS ────────────────────────────────────────────────────────────
 
-  app.post("/api/tasks", (req, res) => {
-    const { id, feature_id, sprint_id, title, statement, description, acceptance_criteria, story_points, status, priority, assignee_id, reporter_id, column_id, type, epic_id, parent_id, definition_of_done, blocker, creator_id, user_id } = req.body;
-    const insert = db.prepare(`
-      INSERT INTO tasks (id, feature_id, sprint_id, title, statement, description, acceptance_criteria, story_points, status, priority, assignee_id, reporter_id, column_id, type, epic_id, parent_id, definition_of_done, blocker, creator_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    insert.run(
-      id, 
-      feature_id || null, 
-      sprint_id || null, 
-      title, 
-      statement || null, 
-      description || null, 
-      acceptance_criteria || null, 
-      story_points || 0, 
-      status, 
-      priority || 'P3', 
-      assignee_id || null, 
-      reporter_id || null, 
-      column_id || null, 
-      type || 'story', 
-      epic_id || null, 
-      parent_id || null, 
-      definition_of_done || null, 
-      blocker || null, 
-      creator_id || null
-    );
-    
-    if (user_id) {
-      logAudit('task', id, user_id, 'CREATE', req.body);
+  app.post("/api/invitations", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
+    try {
+      const { email, role_id, project_id } = req.body;
+      const tenantId = req.authUser.tenant_id;
+
+      if (!(await checkPlanLimit(tenantId, 'members'))) {
+        return res.status(403).json({ error: 'Member limit reached. Upgrade your plan.' });
+      }
+
+      const existing = await queryOne('SELECT id FROM users WHERE email = ? AND tenant_id = ?', [email, tenantId]);
+      if (existing) return res.status(400).json({ error: 'User already in workspace' });
+
+      const inviteToken = uid();
+      const expiresAt   = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      await execute('INSERT INTO invitations (id, tenant_id, email, role_id, token, invited_by, project_id, expires_at) VALUES (?,?,?,?,?,?,?,?)',
+        [uid(), tenantId, email, role_id || 'dev', inviteToken, req.authUser.id, project_id || null, expiresAt]);
+
+      const inviter = await queryOne('SELECT full_name FROM users WHERE id = ?', [req.authUser.id]);
+      const tenant  = await getTenant(tenantId);
+      await sendInviteEmail(email, inviter?.full_name || 'A teammate', tenant?.name || 'your workspace', inviteToken);
+
+      res.status(201).json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.get("/api/invitations", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
+    const invitations = await query('SELECT * FROM invitations WHERE tenant_id = ? ORDER BY created_at DESC', [req.authUser.tenant_id]);
+    res.json(invitations);
+  });
+
+  // ── AI CONFIGURATION ───────────────────────────────────────────────────────
+
+  app.get("/api/ai-config", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
+    const config = await queryOne('SELECT * FROM ai_configurations WHERE tenant_id = ?', [req.authUser.tenant_id]);
+    // Never return the actual API key
+    if (config) { config.api_key_encrypted = config.api_key_encrypted ? '***configured***' : null; }
+    res.json(config || { provider: 'gemini', model: 'gemini-2.0-flash', tone: 'professional', system_prompt: DEFAULT_SYSTEM_PROMPT, auto_actions: '[]' });
+  });
+
+  app.put("/api/ai-config", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
+    try {
+      const { provider, model, api_key, system_prompt, temperature, tone, auto_actions } = req.body;
+      const tenantId = req.authUser.tenant_id;
+      const existing = await queryOne('SELECT id FROM ai_configurations WHERE tenant_id = ?', [tenantId]);
+
+      // Only update api_key if a new one is provided (not the mask)
+      const keyToStore = api_key && api_key !== '***configured***' ? api_key : null;
+
+      if (existing) {
+        const updates: any = { provider, model, temperature, tone, system_prompt, auto_actions: JSON.stringify(auto_actions || []) };
+        if (keyToStore) updates.api_key_encrypted = keyToStore;
+        const keys = Object.keys(updates);
+        await execute(`UPDATE ai_configurations SET ${keys.map(k => `${k} = ?`).join(', ')}, updated_at = ? WHERE tenant_id = ?`,
+          [...Object.values(updates), now(), tenantId]);
+      } else {
+        await execute('INSERT INTO ai_configurations (id, tenant_id, provider, model, api_key_encrypted, system_prompt, temperature, tone, auto_actions) VALUES (?,?,?,?,?,?,?,?,?)',
+          [uid(), tenantId, provider, model, keyToStore, system_prompt, temperature || 0.7, tone || 'professional', JSON.stringify(auto_actions || [])]);
+      }
+      res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.get("/api/ai-config/models", (req, res) => res.json(AVAILABLE_MODELS));
+
+  // AI Chat endpoint
+  app.post("/api/ai/chat", async (req: AuthReq, res) => {
+    try {
+      const { messages, taskContext } = req.body;
+      const tenantId = req.authUser.tenant_id;
+      const configRow = await queryOne('SELECT * FROM ai_configurations WHERE tenant_id = ?', [tenantId]);
+
+      const config = {
+        provider: configRow?.provider || 'gemini',
+        model: configRow?.model,
+        apiKey: configRow?.api_key_encrypted,
+        systemPrompt: configRow?.system_prompt,
+        temperature: configRow?.temperature,
+        tone: configRow?.tone,
+      };
+
+      const reply = await callAI(config, messages, taskContext);
+      res.json({ reply });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── PROJECTS ───────────────────────────────────────────────────────────────
+
+  app.get("/api/projects", async (req: AuthReq, res) => {
+    const { id: userId, role_id, tenant_id } = req.authUser;
+    if (role_id === 'superadmin') return res.json(await query('SELECT * FROM projects WHERE tenant_id = ? ORDER BY created_at DESC', [tenant_id]));
+    res.json(await query('SELECT p.* FROM projects p JOIN project_members pm ON pm.project_id = p.id WHERE pm.user_id = ? AND p.tenant_id = ? ORDER BY p.created_at DESC', [userId, tenant_id]));
+  });
+
+  app.post("/api/projects", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
+    try {
+      const tenantId = req.authUser.tenant_id;
+      if (!(await checkPlanLimit(tenantId, 'projects'))) {
+        return res.status(403).json({ error: 'Project limit reached. Upgrade your plan.' });
+      }
+      const { id, name, description, admin_ids } = req.body;
+      const projectId = id || uid();
+      await execute('INSERT INTO projects (id, tenant_id, name, description, creator_id) VALUES (?,?,?,?,?)', [projectId, tenantId, name, description||null, req.authUser.id]);
+      await execute('INSERT OR IGNORE INTO project_members (id, project_id, user_id, role) VALUES (?,?,?,?)', [uid(), projectId, req.authUser.id, 'superadmin']);
+      if (Array.isArray(admin_ids)) {
+        for (const aId of admin_ids) await execute('INSERT OR IGNORE INTO project_members (id, project_id, user_id, role) VALUES (?,?,?,?)', [uid(), projectId, aId, 'admin']);
+      }
+      res.status(201).json({ success: true, id: projectId });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete("/api/projects/:id", requireRole('superadmin'), async (req: AuthReq, res) => {
+    await execute('DELETE FROM project_members WHERE project_id = ?', [req.params.id]);
+    await execute('DELETE FROM projects WHERE id = ? AND tenant_id = ?', [req.params.id, req.authUser.tenant_id]);
+    res.json({ success: true });
+  });
+
+  // ── PROJECT MEMBERS ────────────────────────────────────────────────────────
+
+  app.get("/api/projects/:id/members", async (req: AuthReq, res) => {
+    res.json(await query('SELECT pm.*, u.username, u.full_name, u.email, u.role_id, r.name as role_name FROM project_members pm JOIN users u ON pm.user_id = u.id JOIN roles r ON u.role_id = r.id WHERE pm.project_id = ?', [req.params.id]));
+  });
+
+  app.post("/api/projects/:id/members", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
+    try {
+      const { user_id, role } = req.body;
+      await execute('INSERT OR REPLACE INTO project_members (id, project_id, user_id, role) VALUES (?,?,?,?)', [uid(), req.params.id, user_id, role||'member']);
+      res.status(201).json({ success: true });
+    } catch (e: any) { res.status(400).json({ error: e.message }); }
+  });
+
+  app.delete("/api/projects/:projectId/members/:userId", requireRole('superadmin','admin'), async (req, res) => {
+    await execute('DELETE FROM project_members WHERE project_id = ? AND user_id = ?', [req.params.projectId, req.params.userId]);
+    res.json({ success: true });
+  });
+
+  // ── USERS ──────────────────────────────────────────────────────────────────
+
+  app.get("/api/users", async (req: AuthReq, res) => {
+    const { id: userId, role_id, tenant_id } = req.authUser;
+    const { project_id } = req.query as any;
+
+    if (role_id === 'superadmin') {
+      if (project_id && project_id !== 'all') {
+        return res.json(await query('SELECT u.id, u.username, u.full_name, u.role_id, u.email, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id JOIN project_members pm ON pm.user_id = u.id WHERE pm.project_id = ? AND u.tenant_id = ?', [project_id, tenant_id]));
+      }
+      return res.json(await query('SELECT u.id, u.username, u.full_name, u.role_id, u.email, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id WHERE u.tenant_id = ?', [tenant_id]));
     }
-    
-    res.status(201).json({ success: true });
+
+    const projectIds = await getVisibleProjectIds(userId, role_id, tenant_id) ?? [];
+    if (projectIds.length === 0) return res.json([]);
+    const ph = projectIds.map(() => '?').join(',');
+    res.json(await query(`SELECT DISTINCT u.id, u.username, u.full_name, u.role_id, u.email, r.name as role_name FROM users u JOIN roles r ON u.role_id = r.id JOIN project_members pm ON pm.user_id = u.id WHERE pm.project_id IN (${ph}) AND u.tenant_id = ?`, [...projectIds, tenant_id]));
   });
 
-  app.patch("/api/tasks/:id", (req, res) => {
-    const { id } = req.params;
-    const { user_id, ...updates } = req.body;
-    
-    // Auto-set closed_at if status is 'Done'
-    if (updates.status === 'Done' || updates.column_id === 'done') {
-      updates.closed_at = new Date().toISOString();
-    }
-    updates.updated_at = new Date().toISOString();
+  app.post("/api/users", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
+    try {
+      const { id, username, password, role_id, full_name, email, project_id } = req.body;
+      const tenantId = req.authUser.tenant_id;
+      if (req.authUser.role_id === 'admin' && ['superadmin','admin'].includes(role_id)) return res.status(403).json({ error: 'Admins cannot create admin-level users' });
+      if (!(await checkPlanLimit(tenantId, 'members'))) return res.status(403).json({ error: 'Member limit reached. Upgrade your plan.' });
+      const hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
+      const userId = id || uid();
+      await execute('INSERT INTO users (id, tenant_id, username, password_hash, role_id, full_name, email) VALUES (?,?,?,?,?,?,?)', [userId, tenantId, username, hash, role_id, full_name||null, email||null]);
+      if (project_id) await execute('INSERT OR IGNORE INTO project_members (id, project_id, user_id, role) VALUES (?,?,?,?)', [uid(), project_id, userId, 'member']);
+      res.status(201).json({ success: true });
+    } catch (e: any) { res.status(400).json({ error: e.message }); }
+  });
 
-    const keys = Object.keys(updates);
-    const setClause = keys.map(k => `"${k}" = ?`).join(", ");
-    const values = Object.values(updates);
-    
-    const update = db.prepare(`UPDATE tasks SET ${setClause} WHERE id = ?`);
-    update.run(...values, id);
+  app.delete("/api/users/:id", requireRole('superadmin'), async (req: AuthReq, res) => {
+    await execute('DELETE FROM project_members WHERE user_id = ?', [req.params.id]);
+    await execute('DELETE FROM refresh_tokens WHERE user_id = ?', [req.params.id]);
+    await execute('DELETE FROM users WHERE id = ? AND tenant_id = ?', [req.params.id, req.authUser.tenant_id]);
+    res.json({ success: true });
+  });
 
-    if (user_id) {
-      logAudit('task', id, user_id, 'UPDATE', updates);
-    }
+  app.post("/api/users/:id/change-password", async (req: AuthReq, res) => {
+    try {
+      const { id } = req.params;
+      if (req.authUser.id !== id && req.authUser.role_id !== 'superadmin') return res.status(403).json({ error: 'Cannot change another user\'s password' });
+      const { currentPassword, newPassword } = req.body;
+      if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'Password too short' });
+      const user = await queryOne('SELECT * FROM users WHERE id = ?', [id]) as any;
+      if (!user) return res.status(404).json({ error: 'User not found' });
+      if (req.authUser.role_id !== 'superadmin' && !bcrypt.compareSync(currentPassword, user.password_hash)) return res.status(401).json({ error: 'Current password incorrect' });
+      await execute('UPDATE users SET password_hash = ? WHERE id = ?', [bcrypt.hashSync(newPassword, BCRYPT_ROUNDS), id]);
+      res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
 
-    // Automation: Check if all features in an epic are closed
-    const task = db.prepare("SELECT epic_id, feature_id FROM tasks WHERE id = ?").get(id) as any;
-    if (task && task.feature_id) {
-      const feature = db.prepare("SELECT epic_id FROM features WHERE id = ?").get(task.feature_id) as any;
-      if (feature) {
-        const totalTasks = db.prepare("SELECT COUNT(*) as count FROM tasks WHERE feature_id = ?").get(task.feature_id) as any;
-        const closedTasks = db.prepare("SELECT COUNT(*) as count FROM tasks WHERE feature_id = ? AND closed_at IS NOT NULL").get(task.feature_id) as any;
-        
-        if (totalTasks.count > 0 && totalTasks.count === closedTasks.count) {
-          db.prepare("UPDATE features SET status = 'Verified', closed_at = ? WHERE id = ?").run(new Date().toISOString(), task.feature_id);
-          
-          // Check Epic
-          if (feature.epic_id) {
-            const totalFeatures = db.prepare("SELECT COUNT(*) as count FROM features WHERE epic_id = ?").get(feature.epic_id) as any;
-            const closedFeatures = db.prepare("SELECT COUNT(*) as count FROM features WHERE epic_id = ? AND status = 'Verified'").get(feature.epic_id) as any;
-            if (totalFeatures.count > 0 && totalFeatures.count === closedFeatures.count) {
-              db.prepare("UPDATE epics SET status = 'Completata', closed_at = ? WHERE id = ?").run(new Date().toISOString(), feature.epic_id);
-            }
+  // ── COLUMNS ────────────────────────────────────────────────────────────────
+
+  app.get("/api/columns", async (req: AuthReq, res) => {
+    res.json(await query(`SELECT * FROM columns WHERE tenant_id = ? ORDER BY "order" ASC`, [req.authUser.tenant_id]));
+  });
+
+  // ── TASKS ──────────────────────────────────────────────────────────────────
+
+  app.get("/api/tasks", async (req: AuthReq, res) => {
+    const { id: userId, role_id, tenant_id } = req.authUser;
+    const projectIds = await getVisibleProjectIds(userId, role_id, tenant_id);
+    if (!projectIds) return res.json(await query('SELECT * FROM tasks WHERE tenant_id = ?', [tenant_id]));
+    if (projectIds.length === 0) return res.json([]);
+    const ph = projectIds.map(() => '?').join(',');
+    res.json(await query(`SELECT DISTINCT t.* FROM tasks t LEFT JOIN epics e ON t.epic_id = e.id WHERE t.tenant_id = ? AND (e.project_id IN (${ph}) OR t.assignee_id = ?)`, [tenant_id, ...projectIds, userId]));
+  });
+
+  app.post("/api/tasks", async (req: AuthReq, res) => {
+    try {
+      const { id, feature_id, sprint_id, title, statement, description, acceptance_criteria, story_points, status, priority, assignee_id, reporter_id, column_id, type, epic_id, parent_id, definition_of_done, blocker } = req.body;
+      const taskId = id || uid();
+      await execute('INSERT INTO tasks (id, tenant_id, feature_id, sprint_id, title, statement, description, acceptance_criteria, story_points, status, priority, assignee_id, reporter_id, column_id, type, epic_id, parent_id, definition_of_done, blocker, creator_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        [taskId, req.authUser.tenant_id, feature_id||null, sprint_id||null, title, statement||null, description||null, acceptance_criteria||null, story_points||0, status, priority||'P3', assignee_id||null, reporter_id||null, column_id||null, type||'story', epic_id||null, parent_id||null, definition_of_done||null, blocker||null, req.authUser.id]);
+      await logAudit(req.authUser.tenant_id, 'task', taskId, req.authUser.id, 'CREATE', req.body);
+      res.status(201).json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.patch("/api/tasks/:id", async (req: AuthReq, res) => {
+    try {
+      const updates: any = { ...req.body };
+      delete updates.user_id;
+      if (updates.status === 'Done' || updates.column_id === `${req.authUser.tenant_id}-done`) updates.closed_at = now();
+      updates.updated_at = now();
+      const keys = Object.keys(updates);
+      await execute(`UPDATE tasks SET ${keys.map(k => `"${k}" = ?`).join(', ')} WHERE id = ? AND tenant_id = ?`, [...Object.values(updates), req.params.id, req.authUser.tenant_id]);
+      await logAudit(req.authUser.tenant_id, 'task', req.params.id, req.authUser.id, 'UPDATE', updates);
+
+      // Auto-close feature/epic
+      const task = await queryOne('SELECT epic_id, feature_id FROM tasks WHERE id = ?', [req.params.id]);
+      if (task?.feature_id) {
+        const total  = (await queryOne('SELECT COUNT(*) as c FROM tasks WHERE feature_id = ?', [task.feature_id]))?.c || 0;
+        const closed = (await queryOne('SELECT COUNT(*) as c FROM tasks WHERE feature_id = ? AND closed_at IS NOT NULL', [task.feature_id]))?.c || 0;
+        if (total > 0 && total === closed) {
+          await execute("UPDATE features SET status = 'Verified', closed_at = ? WHERE id = ?", [now(), task.feature_id]);
+          const feat = await queryOne('SELECT epic_id FROM features WHERE id = ?', [task.feature_id]);
+          if (feat?.epic_id) {
+            const tf = (await queryOne('SELECT COUNT(*) as c FROM features WHERE epic_id = ?', [feat.epic_id]))?.c || 0;
+            const cf = (await queryOne("SELECT COUNT(*) as c FROM features WHERE epic_id = ? AND status = 'Verified'", [feat.epic_id]))?.c || 0;
+            if (tf > 0 && tf === cf) await execute("UPDATE epics SET status = 'Completata', closed_at = ? WHERE id = ?", [now(), feat.epic_id]);
           }
         }
       }
-    }
+      if (task?.epic_id) {
+        const total = (await queryOne('SELECT COUNT(*) as c FROM tasks WHERE epic_id = ?', [task.epic_id]))?.c || 0;
+        const done  = (await queryOne("SELECT COUNT(*) as c FROM tasks WHERE epic_id = ? AND status = 'Done'", [task.epic_id]))?.c || 0;
+        await execute('UPDATE epics SET progress = ? WHERE id = ?', [total > 0 ? (done/total)*100 : 0, task.epic_id]);
+      }
+      res.json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
 
-    // Recalculate Epic Progress
-    if (task && task.epic_id) {
-      const totalStories = db.prepare("SELECT COUNT(*) as count FROM tasks WHERE epic_id = ?").get(task.epic_id) as any;
-      const doneStories = db.prepare("SELECT COUNT(*) as count FROM tasks WHERE epic_id = ? AND status = 'Done'").get(task.epic_id) as any;
-      const progress = totalStories.count > 0 ? (doneStories.count / totalStories.count) * 100 : 0;
-      db.prepare("UPDATE epics SET progress = ? WHERE id = ?").run(progress, task.epic_id);
-    }
-
+  app.delete("/api/tasks/:id", async (req: AuthReq, res) => {
+    await execute('DELETE FROM tasks WHERE id = ? AND tenant_id = ?', [req.params.id, req.authUser.tenant_id]);
     res.json({ success: true });
   });
 
-  app.get("/api/tasks/:id/comments", (req, res) => {
-    const { id } = req.params;
-    const comments = db.prepare(`
-      SELECT c.*, u.full_name as user_name 
-      FROM comments c 
-      JOIN users u ON c.user_id = u.id 
-      WHERE c.task_id = ? 
-      ORDER BY c.created_at ASC
-    `).all(id);
-    res.json(comments);
+  // ── EPICS / FEATURES / SPRINTS (pattern riutilizzato) ─────────────────────
+
+  const tenantFilter = (roleId: string, userId: string) => roleId === 'superadmin' ? '' : '';
+
+  app.get("/api/epics", async (req: AuthReq, res) => {
+    const { id: userId, role_id, tenant_id } = req.authUser;
+    const projectIds = await getVisibleProjectIds(userId, role_id, tenant_id);
+    if (!projectIds) return res.json(await query('SELECT * FROM epics WHERE tenant_id = ?', [tenant_id]));
+    if (projectIds.length === 0) return res.json([]);
+    const ph = projectIds.map(() => '?').join(',');
+    res.json(await query(`SELECT * FROM epics WHERE tenant_id = ? AND (project_id IN (${ph}) OR project_id IS NULL)`, [tenant_id, ...projectIds]));
   });
 
-  app.post("/api/comments", (req, res) => {
-    const { id, task_id, user_id, content } = req.body;
-    db.prepare("INSERT INTO comments (id, task_id, user_id, content) VALUES (?, ?, ?, ?)").run(id, task_id, user_id, content);
+  app.post("/api/epics", async (req: AuthReq, res) => {
+    try {
+      const { id, project_id, title, business_value, description, status, priority, owner_id, start_date, end_date } = req.body;
+      const epicId = id || uid();
+      await execute('INSERT INTO epics (id, tenant_id, project_id, title, business_value, description, status, priority, owner_id, creator_id, start_date, end_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        [epicId, req.authUser.tenant_id, project_id||null, title, business_value||null, description||null, status||'Backlog', priority||'P3', owner_id||null, req.authUser.id, start_date||null, end_date||null]);
+      await logAudit(req.authUser.tenant_id, 'epic', epicId, req.authUser.id, 'CREATE', req.body);
+      res.status(201).json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete("/api/epics/:id", async (req: AuthReq, res) => {
+    await execute('DELETE FROM epics WHERE id = ? AND tenant_id = ?', [req.params.id, req.authUser.tenant_id]);
+    res.json({ success: true });
+  });
+
+  app.get("/api/features", async (req: AuthReq, res) => {
+    const { id: userId, role_id, tenant_id } = req.authUser;
+    const projectIds = await getVisibleProjectIds(userId, role_id, tenant_id);
+    if (!projectIds) return res.json(await query('SELECT * FROM features WHERE tenant_id = ?', [tenant_id]));
+    if (projectIds.length === 0) return res.json([]);
+    const ph = projectIds.map(() => '?').join(',');
+    res.json(await query(`SELECT f.* FROM features f JOIN epics e ON f.epic_id = e.id WHERE f.tenant_id = ? AND e.project_id IN (${ph})`, [tenant_id, ...projectIds]));
+  });
+
+  app.post("/api/features", async (req: AuthReq, res) => {
+    try {
+      const { id, epic_id, title, benefit_hypothesis, acceptance_criteria, rough_estimate, status, tags, assignee_id } = req.body;
+      const featId = id || uid();
+      await execute('INSERT INTO features (id, tenant_id, epic_id, title, benefit_hypothesis, acceptance_criteria, rough_estimate, status, tags, assignee_id, creator_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        [featId, req.authUser.tenant_id, epic_id, title, benefit_hypothesis||null, acceptance_criteria||null, rough_estimate||null, status||'Draft', tags||null, assignee_id||null, req.authUser.id]);
+      res.status(201).json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete("/api/features/:id", async (req: AuthReq, res) => {
+    await execute('DELETE FROM features WHERE id = ? AND tenant_id = ?', [req.params.id, req.authUser.tenant_id]);
+    res.json({ success: true });
+  });
+
+  app.get("/api/sprints", async (req: AuthReq, res) => {
+    const { id: userId, role_id, tenant_id } = req.authUser;
+    const projectIds = await getVisibleProjectIds(userId, role_id, tenant_id);
+    if (!projectIds) return res.json(await query('SELECT * FROM sprints WHERE tenant_id = ?', [tenant_id]));
+    if (projectIds.length === 0) return res.json([]);
+    const ph = projectIds.map(() => '?').join(',');
+    res.json(await query(`SELECT * FROM sprints WHERE tenant_id = ? AND (project_id IN (${ph}) OR project_id IS NULL)`, [tenant_id, ...projectIds]));
+  });
+
+  app.post("/api/sprints", async (req: AuthReq, res) => {
+    try {
+      const { id, project_id, name, goal, start_date, end_date, status, target_capacity, assignee_id } = req.body;
+      const sprintId = id || uid();
+      await execute('INSERT INTO sprints (id, tenant_id, project_id, name, goal, start_date, end_date, status, target_capacity, assignee_id, creator_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        [sprintId, req.authUser.tenant_id, project_id||null, name, goal||null, start_date||null, end_date||null, status||'Pianificato', target_capacity||0, assignee_id||null, req.authUser.id]);
+      res.status(201).json({ success: true });
+    } catch (e: any) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.delete("/api/sprints/:id", async (req: AuthReq, res) => {
+    await execute('DELETE FROM sprints WHERE id = ? AND tenant_id = ?', [req.params.id, req.authUser.tenant_id]);
+    res.json({ success: true });
+  });
+
+  // ── COMMENTS / ATTACHMENTS / CUSTOM FIELDS / AUDIT / TESTING ──────────────
+
+  app.get("/api/tasks/:id/comments", async (req, res) => res.json(await query('SELECT c.*, u.full_name as user_name FROM comments c JOIN users u ON c.user_id = u.id WHERE c.task_id = ? ORDER BY c.created_at ASC', [req.params.id])));
+  app.post("/api/comments", async (req: AuthReq, res) => {
+    const { id, task_id, content } = req.body;
+    await execute('INSERT INTO comments (id, tenant_id, task_id, user_id, content) VALUES (?,?,?,?,?)', [id||uid(), req.authUser.tenant_id, task_id, req.authUser.id, content]);
     res.status(201).json({ success: true });
   });
-
-  app.get("/api/tasks/:id/attachments", (req, res) => {
-    const { id } = req.params;
-    const attachments = db.prepare("SELECT * FROM attachments WHERE task_id = ?").all(id);
-    res.json(attachments);
-  });
-
-  app.post("/api/attachments", (req, res) => {
+  app.get("/api/tasks/:id/attachments", async (req, res) => res.json(await query('SELECT * FROM attachments WHERE task_id = ?', [req.params.id])));
+  app.post("/api/attachments", async (req: AuthReq, res) => {
     const { id, task_id, name, url, type } = req.body;
-    db.prepare("INSERT INTO attachments (id, task_id, name, url, type) VALUES (?, ?, ?, ?, ?)").run(id, task_id, name, url, type);
+    await execute('INSERT INTO attachments (id, tenant_id, task_id, name, url, type) VALUES (?,?,?,?,?,?)', [id||uid(), req.authUser.tenant_id, task_id, name, url, type]);
     res.status(201).json({ success: true });
   });
 
-  // Custom Fields API
-  app.get("/api/custom-fields/definitions", (req, res) => {
-    res.json(db.prepare("SELECT * FROM custom_field_definitions").all());
-  });
-
-  app.post("/api/custom-fields/definitions", (req, res) => {
+  app.get("/api/custom-fields/definitions", async (req: AuthReq, res) => res.json(await query('SELECT * FROM custom_field_definitions WHERE tenant_id = ?', [req.authUser.tenant_id])));
+  app.post("/api/custom-fields/definitions", requireRole('superadmin','admin'), async (req: AuthReq, res) => {
     const { id, entity_type, name, type } = req.body;
-    db.prepare("INSERT INTO custom_field_definitions (id, entity_type, name, type) VALUES (?, ?, ?, ?)").run(id, entity_type, name, type);
+    await execute('INSERT INTO custom_field_definitions (id, tenant_id, entity_type, name, type) VALUES (?,?,?,?,?)', [id||uid(), req.authUser.tenant_id, entity_type, name, type]);
     res.status(201).json({ success: true });
   });
-
-  app.delete("/api/custom-fields/definitions/:id", (req, res) => {
-    const { id } = req.params;
-    db.prepare("DELETE FROM custom_field_values WHERE field_definition_id = ?").run(id);
-    db.prepare("DELETE FROM custom_field_definitions WHERE id = ?").run(id);
+  app.delete("/api/custom-fields/definitions/:id", requireRole('superadmin','admin'), async (req, res) => {
+    await execute('DELETE FROM custom_field_values WHERE field_definition_id = ?', [req.params.id]);
+    await execute('DELETE FROM custom_field_definitions WHERE id = ?', [req.params.id]);
     res.json({ success: true });
   });
-
-  app.get("/api/custom-fields/values/:entityId", (req, res) => {
-    const { entityId } = req.params;
-    const values = db.prepare(`
-      SELECT v.*, d.name, d.type, d.entity_type
-      FROM custom_field_values v
-      JOIN custom_field_definitions d ON v.field_definition_id = d.id
-      WHERE v.entity_id = ?
-    `).all(entityId);
-    res.json(values);
-  });
-
-  app.post("/api/custom-fields/values", (req, res) => {
+  app.get("/api/custom-fields/values/:entityId", async (req, res) => res.json(await query('SELECT v.*, d.name, d.type, d.entity_type FROM custom_field_values v JOIN custom_field_definitions d ON v.field_definition_id = d.id WHERE v.entity_id = ?', [req.params.entityId])));
+  app.post("/api/custom-fields/values", async (req, res) => {
     const { entity_id, field_definition_id, value } = req.body;
-    const id = Math.random().toString(36).substr(2, 9);
-    
-    // Upsert logic
-    const existing = db.prepare("SELECT id FROM custom_field_values WHERE entity_id = ? AND field_definition_id = ?").get(entity_id, field_definition_id) as any;
-    if (existing) {
-      db.prepare("UPDATE custom_field_values SET value = ? WHERE id = ?").run(value, existing.id);
-    } else {
-      db.prepare("INSERT INTO custom_field_values (id, entity_id, field_definition_id, value) VALUES (?, ?, ?, ?)").run(id, entity_id, field_definition_id, value);
-    }
+    const existing = await queryOne('SELECT id FROM custom_field_values WHERE entity_id = ? AND field_definition_id = ?', [entity_id, field_definition_id]);
+    if (existing) await execute('UPDATE custom_field_values SET value = ? WHERE id = ?', [value, existing.id]);
+    else await execute('INSERT INTO custom_field_values (id, entity_id, field_definition_id, value) VALUES (?,?,?,?)', [uid(), entity_id, field_definition_id, value]);
     res.json({ success: true });
   });
 
-  app.delete("/api/tasks/:id", (req, res) => {
-    const { id } = req.params;
-    db.prepare("DELETE FROM tasks WHERE id = ?").run(id);
-    res.json({ success: true });
-  });
+  app.get("/api/audit-logs/:entityType/:entityId", async (req: AuthReq, res) =>
+    res.json(await query('SELECT a.*, u.full_name as user_name FROM audit_logs a JOIN users u ON a.user_id = u.id WHERE a.entity_type = ? AND a.entity_id = ? AND a.tenant_id = ? ORDER BY a.created_at DESC', [req.params.entityType, req.params.entityId, req.authUser.tenant_id]))
+  );
 
-  // Epics, Features, Sprints Routes
-  app.get("/api/epics", (req, res) => {
-    res.json(db.prepare("SELECT * FROM epics").all());
-  });
-  app.post("/api/epics", (req, res) => {
-    const { id, project_id, title, business_value, description, status, priority, owner_id, creator_id, start_date, end_date, user_id } = req.body;
-    db.prepare("INSERT INTO epics (id, project_id, title, business_value, description, status, priority, owner_id, creator_id, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(
-        id, 
-        project_id || null, 
-        title, 
-        business_value || null, 
-        description || null, 
-        status || 'Backlog', 
-        priority || 'P3', 
-        owner_id || null, 
-        creator_id || null, 
-        start_date || null, 
-        end_date || null
-      );
-    
-    if (user_id) {
-      logAudit('epic', id, user_id, 'CREATE', req.body);
-    }
-    res.status(201).json({ success: true });
-  });
-
-  app.delete("/api/epics/:id", (req, res) => {
-    const { id } = req.params;
-    db.prepare("DELETE FROM epics WHERE id = ?").run(id);
-    res.json({ success: true });
-  });
-
-  app.get("/api/features", (req, res) => {
-    res.json(db.prepare("SELECT * FROM features").all());
-  });
-  app.post("/api/features", (req, res) => {
-    const { id, epic_id, title, benefit_hypothesis, acceptance_criteria, rough_estimate, status, tags, assignee_id, creator_id, user_id } = req.body;
-    db.prepare("INSERT INTO features (id, epic_id, title, benefit_hypothesis, acceptance_criteria, rough_estimate, status, tags, assignee_id, creator_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(
-        id, 
-        epic_id, 
-        title, 
-        benefit_hypothesis || null, 
-        acceptance_criteria || null, 
-        rough_estimate || null, 
-        status || 'Draft', 
-        tags || null, 
-        assignee_id || null, 
-        creator_id || null
-      );
-    
-    if (user_id) {
-      logAudit('feature', id, user_id, 'CREATE', req.body);
-    }
-    res.status(201).json({ success: true });
-  });
-
-  app.delete("/api/features/:id", (req, res) => {
-    const { id } = req.params;
-    db.prepare("DELETE FROM features WHERE id = ?").run(id);
-    res.json({ success: true });
-  });
-
-  app.get("/api/sprints", (req, res) => {
-    res.json(db.prepare("SELECT * FROM sprints").all());
-  });
-  app.post("/api/sprints", (req, res) => {
-    const { id, name, goal, start_date, end_date, status, target_capacity, assignee_id, creator_id, user_id } = req.body;
-    db.prepare("INSERT INTO sprints (id, name, goal, start_date, end_date, status, target_capacity, assignee_id, creator_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(
-        id, 
-        name, 
-        goal || null, 
-        start_date || null, 
-        end_date || null, 
-        status || 'Pianificato', 
-        target_capacity || 0, 
-        assignee_id || null, 
-        creator_id || null
-      );
-    
-    if (user_id) {
-      logAudit('sprint', id, user_id, 'CREATE', req.body);
-    }
-    res.status(201).json({ success: true });
-  });
-
-  app.delete("/api/sprints/:id", (req, res) => {
-    const { id } = req.params;
-    db.prepare("DELETE FROM sprints WHERE id = ?").run(id);
-    res.json({ success: true });
-  });
-
-  app.get("/api/audit-logs/:entityType/:entityId", (req, res) => {
-    const { entityType, entityId } = req.params;
-    const logs = db.prepare(`
-      SELECT a.*, u.full_name as user_name 
-      FROM audit_logs a 
-      JOIN users u ON a.user_id = u.id 
-      WHERE a.entity_type = ? AND a.entity_id = ? 
-      ORDER BY a.created_at DESC
-    `).all(entityType, entityId);
-    res.json(logs);
-  });
-
-  // Testing Routes
-  app.get("/api/test-suites", (req, res) => {
-    const suites = db.prepare("SELECT * FROM test_suites").all();
-    res.json(suites);
-  });
-
-  app.post("/api/test-suites", (req, res) => {
+  app.get("/api/test-suites", async (req: AuthReq, res) => res.json(await query('SELECT * FROM test_suites WHERE tenant_id = ?', [req.authUser.tenant_id])));
+  app.post("/api/test-suites", async (req: AuthReq, res) => {
     const { id, name, description } = req.body;
-    db.prepare("INSERT INTO test_suites (id, name, description) VALUES (?, ?, ?)").run(id, name, description);
+    await execute('INSERT INTO test_suites (id, tenant_id, name, description) VALUES (?,?,?,?)', [id||uid(), req.authUser.tenant_id, name, description]);
     res.status(201).json({ success: true });
   });
-
-  app.get("/api/test-cases/:suiteId", (req, res) => {
-    const { suiteId } = req.params;
-    const cases = db.prepare("SELECT * FROM test_cases WHERE suite_id = ?").all();
-    res.json(cases);
-  });
-
-  app.post("/api/test-cases", (req, res) => {
+  app.get("/api/test-cases/:suiteId", async (req, res) => res.json(await query('SELECT * FROM test_cases WHERE suite_id = ?', [req.params.suiteId])));
+  app.post("/api/test-cases", async (req, res) => {
     const { id, suite_id, title, steps, expected_result } = req.body;
-    db.prepare("INSERT INTO test_cases (id, suite_id, title, steps, expected_result) VALUES (?, ?, ?, ?, ?)").run(id, suite_id, title, steps, expected_result);
+    await execute('INSERT INTO test_cases (id, suite_id, title, steps, expected_result) VALUES (?,?,?,?,?)', [id||uid(), suite_id, title, steps, expected_result]);
     res.status(201).json({ success: true });
   });
-
-  app.patch("/api/test-cases/:id", (req, res) => {
-    const { id } = req.params;
-    const { status } = req.body;
-    db.prepare("UPDATE test_cases SET status = ?, last_run = CURRENT_TIMESTAMP WHERE id = ?").run(status, id);
+  app.patch("/api/test-cases/:id", async (req, res) => {
+    await execute('UPDATE test_cases SET status = ?, last_run = ? WHERE id = ?', [req.body.status, now(), req.params.id]);
     res.json({ success: true });
   });
 
-  // Vite middleware for development
+  // ── VITE / STATIC ──────────────────────────────────────────────────────────
+
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
-    });
+    app.get("*", (req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`🚀 AgileFlow AI running on http://localhost:${PORT}`);
+    console.log(`📦 Database: ${isPostgres ? 'PostgreSQL' : 'SQLite'}`);
   });
 }
 
-startServer();
+startServer().catch(console.error);
