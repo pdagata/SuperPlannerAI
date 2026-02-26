@@ -30,7 +30,7 @@ export const PLANS = {
     name: 'Enterprise',
     price: 99,
     priceId: process.env.STRIPE_PRICE_ENTERPRISE || 'price_enterprise',
-    max_projects: -1,
+    max_projects: -1, // unlimited
     max_members: -1,
     ai_requests_per_month: -1,
     features: ['Unlimited projects', 'Unlimited members', 'Unlimited AI', 'Custom AI prompts', 'SSO', 'SLA support', 'Audit logs export'],
