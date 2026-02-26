@@ -1,4 +1,4 @@
-// ─── Client-side Auth utilities ─────────────────────────────────────────────────────
+// ─── Client-side Auth utilities ───────────────────────────────────────────────
 
 const TOKEN_KEY = 'agileflow_token';
 const USER_KEY  = 'agileflow_user';
@@ -31,6 +31,7 @@ export async function apiFetch(input: string, init: RequestInit = {}): Promise<R
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(input, { ...init, headers });
   if (res.status === 401) {
+    // Token expired or invalid — force logout
     authStorage.clear();
     window.location.reload();
   }
